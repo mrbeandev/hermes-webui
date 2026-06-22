@@ -2698,22 +2698,110 @@ def set_provider_key(provider_id: str, api_key: str | None) -> dict[str, Any]:
 def remove_provider_key(provider_id: str) -> dict[str, Any]:
     """Remove the API key for a provider.
 
-    Removes the key from ``~/.hermes/.env`` (via ``set_provider_key``)
-    and also cleans up ``config.yaml`` if the key is stored there
+    Removes the key from ``~/.hermes/.env`` (via ``set_provider_key``),
+    cleans up ``config.yaml`` if the key is stored there
     (``providers.<id>.api_key`` or top-level ``model.api_key`` when this
-    provider is the active one).
+    provider is the active one), and clears any credential-pool entries
+    (``auth.json``) for the provider.
+
+    The credential-pool cleanup is what makes the Providers UI "Remove"
+    button work for providers whose key is held in the agent's credential
+    pool (added via ``hermes auth add``, or auto-seeded from an env var).
+    Without it ``_provider_has_key()`` keeps returning True — via
+    ``_has_explicit_pool_credentials()`` — even after the .env/config key
+    is gone, so the provider stays stuck on "API key configured".
 
     Returns a status dict with the operation result.
     """
     result = set_provider_key(provider_id, None)
 
     # Even if the .env removal succeeded, the key might also live in
-    # config.yaml (e.g. providers.<id>.api_key or model.api_key).
-    # Clean those up so _provider_has_key() returns False after removal.
+    # config.yaml (e.g. providers.<id>.api_key or model.api_key) or in the
+    # agent credential pool (auth.json). Clean both up so
+    # _provider_has_key() returns False after removal.
     if result.get("ok"):
         _clean_provider_key_from_config(provider_id)
+        removed_pool = _remove_provider_pool_credentials(provider_id)
+        if removed_pool:
+            result["pool_credentials_removed"] = removed_pool
 
     return result
+
+
+def _remove_provider_pool_credentials(provider_id: str) -> int:
+    """Remove all credential-pool entries (``auth.json``) for a provider.
+
+    Mirrors ``hermes auth remove`` (hermes_cli/auth_commands.py): each entry
+    is dropped via ``CredentialPool.remove_index`` (which persists), then the
+    unified removal dispatch runs the source-specific cleanup and suppresses
+    env-seeded sources so they are not re-seeded on the next ``load_pool``.
+
+    Best-effort: every agent import is guarded so older hermes-agent builds
+    that predate the credential-pool API simply skip this step (the .env /
+    config.yaml removal still happens). Returns the number of entries removed.
+    """
+    try:
+        from agent.credential_pool import load_pool
+    except Exception:
+        return 0
+    try:
+        pool = load_pool(provider_id)
+    except Exception:
+        logger.debug("load_pool(%s) failed during key removal", provider_id, exc_info=True)
+        return 0
+    if pool is None or not hasattr(pool, "entries") or not hasattr(pool, "remove_index"):
+        return 0
+
+    try:
+        from agent.credential_sources import find_removal_step
+    except Exception:
+        find_removal_step = None
+    try:
+        from hermes_cli.auth import suppress_credential_source
+    except Exception:
+        suppress_credential_source = None
+
+    removed_count = 0
+    # Remove from the tail so each remaining index stays valid; remove_index
+    # re-prioritises and persists on every call. Bounded by the live entry
+    # count to avoid any chance of an infinite loop on a misbehaving pool.
+    for _ in range(len(list(pool.entries()))):
+        entries = list(pool.entries())
+        if not entries:
+            break
+        try:
+            removed = pool.remove_index(len(entries))  # 1-indexed
+        except Exception:
+            logger.debug("remove_index failed for %s", provider_id, exc_info=True)
+            break
+        if removed is None:
+            break
+        removed_count += 1
+        # Source-specific cleanup + suppression (e.g. an env-seeded entry must
+        # be suppressed or load_pool re-creates it from the still-present var).
+        if find_removal_step is not None:
+            try:
+                step = find_removal_step(provider_id, getattr(removed, "source", None))
+                if step is not None:
+                    step_result = step.remove_fn(provider_id, removed)
+                    if getattr(step_result, "suppress", False) and suppress_credential_source is not None:
+                        suppress_credential_source(provider_id, removed.source)
+            except Exception:
+                logger.debug(
+                    "pool removal step failed for %s/%s",
+                    provider_id, getattr(removed, "source", "?"), exc_info=True,
+                )
+
+    # Bust the cached pool-credential lookup so _provider_has_key() (via
+    # _has_explicit_pool_credentials) re-reads the now-empty pool on the next
+    # /api/providers call instead of returning a stale "configured" True.
+    if removed_count:
+        try:
+            from api.config import invalidate_credential_pool_cache
+            invalidate_credential_pool_cache(provider_id)
+        except Exception:
+            logger.debug("Failed to invalidate credential pool cache for %s", provider_id, exc_info=True)
+    return removed_count
 
 
 def _clean_provider_key_from_config(provider_id: str) -> None:
