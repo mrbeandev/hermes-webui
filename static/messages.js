@@ -2448,6 +2448,27 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     row.payload={...row.payload,text:row.text};
     return row;
   }
+  // Mid-turn /steer messages are persisted by the agent inside the *next* tool
+  // result, wrapped in an [OUT-OF-BAND USER MESSAGE] … [/OUT-OF-BAND USER MESSAGE]
+  // marker (agent/prompt_builder.py:format_steer_marker). The transcript renderer
+  // skips role:"tool" messages, so on a settled/reloaded view the steer used to
+  // vanish entirely. Extract it here and render it as a persistent, in-order row.
+  function _extractSteerTexts(content){
+    let s;
+    if(typeof content==='string') s=content;
+    else if(content==null) return [];
+    else { try{ s=JSON.stringify(content); }catch(_e){ s=String(content); } }
+    if(!s || s.indexOf('OUT-OF-BAND USER MESSAGE')===-1) return [];
+    const re=/\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*([\s\S]*?)\s*\[\/OUT-OF-BAND USER MESSAGE\]/g;
+    const out=[]; let m;
+    while((m=re.exec(s))!==null){ const t=(m[1]||'').trim(); if(t) out.push(t); }
+    return out;
+  }
+  function _anchorSceneSteerRow(text, orderIndex, messageIndex){
+    const row=_anchorSceneProseRow('↪ **Steered:** '+String(text||'').trim(), orderIndex, messageIndex);
+    row.is_steer=true;
+    return row;
+  }
   function _anchorSceneThinkingRow(text, orderIndex, messageIndex){
     const row=_anchorSceneRowBase('thinking','reasoning','reasoning',orderIndex,messageIndex);
     row.text=String(text||'');
@@ -2514,7 +2535,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     let order=0;
     for(let idx=turnStart+1;idx<lastAsstIndex;idx+=1){
       const message=messages[idx];
-      if(!message||message.role!=='assistant') continue;
+      if(!message) continue;
+      if(message.role==='tool'){
+        for(const _st of _extractSteerTexts(message.content)) add(idx,_anchorSceneSteerRow(_st,order++,idx));
+        continue;
+      }
+      if(message.role!=='assistant') continue;
       const text=_anchorSceneMessageText(message);
       if(_anchorSceneCleanText(text)) add(idx,_anchorSceneProseRow(text,order++,idx));
       const reasoning=_anchorSceneMessageReasoningText(message);
